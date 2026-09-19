@@ -1,3 +1,4 @@
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://DealVanguard.streamlit.app)
 # DealVanguard AI
 
 **DealVanguard AI** is an enterprise deal diligence platform built for automated financial extraction, risk modeling, and interactive deal analytics. Powered by Claude, DuckDB, and Streamlit, it enables seamless deal ingestion, automated schema parsing, and interactive stress testing.
