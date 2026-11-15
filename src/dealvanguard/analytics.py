@@ -1,115 +1,90 @@
-import logging
-from typing import Dict, Any, List
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
 
 from dealvanguard.schemas import FinancialMetrics
+from dealvanguard.stress_engine import DSCR_HEALTHY_THRESHOLD, DealStressEngine
 
-logger = logging.getLogger(__name__)
+# Underwriting thresholds. All percentages are on the same 0-100 scale as the schema.
+MIN_GROSS_MARGIN_PCT = 70.0
+MIN_LTV_CAC = 3.0
+MIN_NRR_PCT = 100.0
+MIN_STRESSED_RUNWAY_MONTHS = 6.0
+MIN_RULE_OF_40 = 40.0
+STRESS_HAIRCUT = 0.20
+
 
 class AnalyticsSummary(BaseModel):
-    """Derived SaaS KPIs and calculated risk indicators."""
+    """Derived KPIs and automated underwriting flags."""
+
     rule_of_40: float = Field(
         ...,
-        description="Growth Rate (or NRR proxy) + EBITDA Margin %."
+        description="(NRR - 100) as a growth proxy plus EBITDA margin, in percentage points.",
     )
-    cac_payback_months: float = Field(
+    annual_burn_to_arr: float = Field(
         ...,
-        description="Months required to recover CAC based on MRR and Gross Margin."
+        description="Annualized burn divided by ARR (a simple burn-efficiency ratio).",
     )
-    arr_per_employee_estimate: float = Field(
-        default=0.0,
-        description="Estimated ARR per employee based on head count provided."
+    runway_stress_tested: Optional[float] = Field(
+        default=None,
+        description="Runway in months after a 20% revenue haircut, or None if cash cannot be inferred.",
     )
-    burn_multiple: float = Field(
-        ...,
-        description="Net Burn / Net New ARR. (efficiency ratio)."
-    )
-    runway_stress_tested: float = Field(
-            ...,
-            description="Estimated runway (months) under a 20% revenue contraction scenario."
-        )
     red_flags: List[str] = Field(
-            default_factory=list,
-            description="Automated risk triggers based on PE underwriting thresholds."
-        )
+        default_factory=list,
+        description="Automated risk triggers based on PE underwriting thresholds.",
+    )
+
 
 class DealAnalyticsEngine:
-    """Computes advanced financial KPIs, stress test models, and automated PE underwriting flags from raw deal metrics.
-    """
+    """Computes derived KPIs and automated underwriting flags from extracted metrics."""
 
     @staticmethod
     def analyze_deal(metrics: FinancialMetrics) -> AnalyticsSummary:
-        """Compute derived metrics and evaluated deal risk profile."""
         red_flags: List[str] = []
 
-        gross_margin_pct = metrics.gross_margin
-        if gross_margin_pct < 0.70:
+        if metrics.gross_margin < MIN_GROSS_MARGIN_PCT:
             red_flags.append(
-                f"Low Gross Margin ({gross_margin_pct * 100:.1f}%). SaaS target is >= 75%."
+                f"Low gross margin ({metrics.gross_margin:.1f}%). Target is at least {MIN_GROSS_MARGIN_PCT:.0f}%."
             )
 
-        ltv_cac = metrics.ltv_cac_ratio
-        if ltv_cac < 3.0:
+        if metrics.ltv_cac_ratio < MIN_LTV_CAC:
             red_flags.append(
-                f"Suboptimal LTV/CAC ratio ({ltv_cac:.2f}x). Standard target is >= 3.0x."
+                f"Suboptimal LTV/CAC ratio ({metrics.ltv_cac_ratio:.2f}x). Target is at least {MIN_LTV_CAC:.1f}x."
             )
 
-        monthly_gross_profit = (metrics.mrr) * gross_margin_pct
-        if monthly_gross_profit > 0:
-            cac_payback_months = round(metrics.cac / monthly_gross_profit, 1)
-        else:
-            cac_payback_months = 999.0
-
-        if cac_payback_months > 18.0:
+        if metrics.net_revenue_retention < MIN_NRR_PCT:
             red_flags.append(
-                f"Extended CAC Payback Period ({cac_payback_months} months). Target is <= 12 months."
+                f"Net revenue contraction (NRR {metrics.net_revenue_retention:.1f}%). Indicates net churn."
             )
 
-        nrr_pct = metrics.net_revenue_retention
-        if nrr_pct < 1.0:
+        engine = DealStressEngine(metrics)
+        stressed = engine.run_revenue_haircut_scenario([STRESS_HAIRCUT])[0]
+        runway_stress_tested = stressed["projected_runway_months"]
+        if runway_stress_tested is not None and runway_stress_tested < MIN_STRESSED_RUNWAY_MONTHS:
             red_flags.append(
-                f"Net Revenue Contraction (NRR {nrr_pct * 100:.1f}%). Indicates net churn."
+                f"Critical runway risk: {runway_stress_tested} months after a {STRESS_HAIRCUT:.0%} revenue haircut."
             )
 
-        stressed_mrr = metrics.mrr * 0.80
-        revenue_loss = metrics.mrr - stressed_mrr
-        stressed_burn = metrics.monthly_burn_rate + revenue_loss
-
-        estimated_cash_reserve = (
-            (metrics.runway_months or 12.0) * metrics.monthly_burn_rate
-        )
-
-        if stressed_burn > 0:
-            runway_stress_tested = round(estimated_cash_reserve / stressed_burn, 1)
-        else:
-            runway_stress_tested = 99.0
-
-        if runway_stress_tested < 6.0:
+        ebitda_margin_pct = (metrics.ebitda / metrics.arr * 100.0) if metrics.arr > 0 else -100.0
+        rule_of_40 = round((metrics.net_revenue_retention - 100.0) + ebitda_margin_pct, 1)
+        if rule_of_40 < MIN_RULE_OF_40:
             red_flags.append(
-                f"Critical Runway Risk (Stress-Tested Runway {runway_stress_tested} months)."
+                f"Fails Rule of 40 ({rule_of_40}). Uses NRR minus 100 as a growth proxy."
             )
 
-        ebitda_margin = (
-            (metrics.ebitda / metrics.arr) if metrics.arr > 0 else -1.0
-            )
-        rule_of_40 = round(((nrr_pct - 1.0) + ebitda_margin) * 100, 1)
-
-        if rule_of_40 < 40.0:
+        dscr = engine.calculate_debt_service_coverage()
+        if dscr["dscr"] is not None and dscr["dscr"] < DSCR_HEALTHY_THRESHOLD:
             red_flags.append(
-                 f"Fails Rule of 40 threshold ({rule_of_40}%)."
-                )
+                f"Weak debt service coverage (DSCR {dscr['dscr']:.2f}x at an assumed 8% interest rate)."
+            )
 
-        burn_multiple = (
-            round(metrics.monthly_burn_rate * 12 / metrics.arr, 2)
-            if metrics.arr > 0
-            else 0.0
+        annual_burn_to_arr = (
+            round(metrics.monthly_burn_rate * 12 / metrics.arr, 2) if metrics.arr > 0 else 0.0
         )
 
         return AnalyticsSummary(
             rule_of_40=rule_of_40,
-            cac_payback_months=cac_payback_months,
-            arr_per_employee_estimate=0.0,
-            burn_multiple=burn_multiple,
+            annual_burn_to_arr=annual_burn_to_arr,
             runway_stress_tested=runway_stress_tested,
-            red_flags=red_flags
+            red_flags=red_flags,
         )

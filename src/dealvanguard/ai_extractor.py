@@ -8,12 +8,17 @@ from dealvanguard.schemas import ExtractionResult
 
 logger = logging.getLogger(__name__)
 
+# These models accept a forced tool call (tool_choice={"type": "tool"}), which the
+# extractor relies on. Claude Sonnet 5.5 and Opus 5.5 reject forced tool use.
+SUPPORTED_MODELS = ["claude-haiku-5-5", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
+DEFAULT_MODEL = SUPPORTED_MODELS[0]
+
 
 class DealExtractor:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-3-7-sonnet-20250219",
+        model: str = DEFAULT_MODEL,
     ):
         self.client = (
             anthropic.Anthropic(api_key=api_key)
@@ -79,8 +84,7 @@ class DealExtractor:
 
             raw_input = tool_use_block.input
 
-            result = ExtractionResult.model_validate(raw_input)
-            return result
+            return ExtractionResult.model_validate(raw_input)
 
         except ValidationError as ve:
             logger.error("Validation error on Claude payload: %s", ve)

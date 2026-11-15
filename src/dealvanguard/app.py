@@ -1,28 +1,58 @@
-import json
 import os
 import sys
 import uuid
-from datetime import datetime
 from pathlib import Path
+from typing import Any, Optional
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
 
-root_dir = Path(__file__).resolve().parent.parent
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
+# Lets `streamlit run src/dealvanguard/app.py` work without `pip install -e .`.
+src_dir = Path(__file__).resolve().parent.parent
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+load_dotenv(src_dir.parent / ".env")  # optional local .env with ANTHROPIC_API_KEY
 
-from dealvanguard.ai_extractor import DealExtractor
-from dealvanguard.database import DatabaseManager
+from dealvanguard import charts
+from dealvanguard.ai_extractor import DEFAULT_MODEL, SUPPORTED_MODELS, DealExtractor
+from dealvanguard.analytics import (
+    MIN_GROSS_MARGIN_PCT,
+    MIN_LTV_CAC,
+    MIN_NRR_PCT,
+    DealAnalyticsEngine,
+)
+from dealvanguard.database import DatabaseManager, record_to_extraction
+from dealvanguard.formatting import (
+    fmt_months,
+    fmt_pct,
+    fmt_ratio,
+    fmt_usd,
+    fmt_usd_compact,
+    parse_base_date,
+    quarter_labels,
+)
+from dealvanguard.samples import load_sample_deal, load_sample_memo
 from dealvanguard.schemas import ExtractionResult
+from dealvanguard.stress_engine import DealStressEngine
+from dealvanguard.theme import (
+    CSS,
+    badge,
+    risk_color,
+    risk_level,
+    section_header,
+)
 
 st.set_page_config(
     page_title="DealVanguard AI | Deal Diligence Platform",
     page_icon="📈",
     layout="wide",
 )
+st.markdown(CSS, unsafe_allow_html=True)
+
+PLACEHOLDER = "-- Select a Saved Deal --"
+RUNWAY_TARGET_MONTHS = 12.0
+CONFIDENCE_TARGET = 0.90
 
 
 @st.cache_resource
@@ -33,692 +63,522 @@ def get_database() -> DatabaseManager:
 db = get_database()
 
 
-def build_extraction_result_from_db_record(record: dict) -> ExtractionResult:
-    """Helper to deserialize flat DuckDB dictionary records into nested ExtractionResult Pydantic schema."""
-    if "raw_extraction" in record and isinstance(record["raw_extraction"], dict):
-        payload = record["raw_extraction"]
-    elif "metadata" in record and "metrics" in record:
-        payload = record
-    else:
-        risks_raw = record.get("key_risks_identified") or record.get(
-            "key_risks_json", []
-        )
-        if isinstance(risks_raw, str):
-            try:
-                risks_parsed = json.loads(risks_raw)
-            except Exception:
-                risks_parsed = [risks_raw]
-        else:
-            risks_parsed = risks_raw if isinstance(risks_raw, list) else []
+# ---------------------------------------------------------------------------
+# Session-state callbacks (run before the script reruns, so they always win)
+# ---------------------------------------------------------------------------
+def set_active_result(result: ExtractionResult, source: str, label: Optional[str] = None) -> None:
+    st.session_state["extraction_result"] = result
+    st.session_state["result_source"] = source
+    st.session_state["result_label"] = label or result.metadata.company_name
 
-        timestamp_val = record.get("extraction_timestamp")
-        if isinstance(timestamp_val, (pd.Timestamp, datetime)):
-            timestamp_str = timestamp_val.isoformat()
-        else:
-            timestamp_str = str(timestamp_val) if timestamp_val else None
 
-        payload = {
-            "confidence_score": float(record.get("confidence_score", 1.0)),
-            "metadata": {
-                "company_name": record.get("company_name", "Unknown"),
-                "industry_sector": record.get(
-                    "industry_sector", "Enterprise Software"
-                ),
-                "founding_year": record.get("founding_year"),
-                "capital_structure": record.get("capital_structure", "Equity"),
-                "extraction_timestamp": timestamp_str,
-            },
-            "metrics": {
-                "arr": record.get("arr"),
-                "mrr": record.get("mrr"),
-                "gross_margin": record.get("gross_margin"),
-                "cac": record.get("cac"),
-                "ltv": record.get("ltv"),
-                "ltv_cac_ratio": record.get("ltv_cac_ratio"),
-                "net_revenue_retention": record.get("net_revenue_retention"),
-                "monthly_burn_rate": record.get("monthly_burn_rate"),
-                "runway_months": record.get("runway_months"),
-                "ebitda": record.get("ebitda"),
-                "total_debt": record.get("total_debt"),
-            },
-            "key_risks_identified": risks_parsed,
-        }
+def on_load_sample() -> None:
+    set_active_result(load_sample_deal(), "sample")
+    st.session_state["saved_deal_select"] = PLACEHOLDER
 
-    if hasattr(ExtractionResult, "model_validate"):
-        return ExtractionResult.model_validate(payload)
-    return ExtractionResult.parse_obj(payload)
 
+def on_load_saved() -> None:
+    label = st.session_state.get("saved_deal_select", PLACEHOLDER)
+    if label == PLACEHOLDER:
+        return
+    record = st.session_state.get("_deal_map", {}).get(label)
+    try:
+        set_active_result(record_to_extraction(record), "saved", label)
+    except Exception as exc:  # shown in the UI on the next run
+        st.session_state["load_error"] = f"Failed to load saved deal: {exc}"
+
+
+def on_clear() -> None:
+    for key in ("extraction_result", "result_source", "result_label"):
+        st.session_state.pop(key, None)
+    st.session_state["saved_deal_select"] = PLACEHOLDER
+
+
+def on_use_sample_memo() -> None:
+    st.session_state["source_option"] = "Text Area"
+    st.session_state["document_text"] = load_sample_memo()
+
+
+# ---------------------------------------------------------------------------
+# Small rendering helpers
+# ---------------------------------------------------------------------------
+def chart_title(title: str, note: Optional[str] = None) -> None:
+    st.markdown(f'<div class="dv-chart-title">{title}</div>', unsafe_allow_html=True)
+    if note:
+        st.markdown(f'<div class="dv-note">{note}</div>', unsafe_allow_html=True)
+
+
+def gradient_cell(value: Any, bad: float, good: float) -> str:
+    """CSS for a table cell whose background follows the value (red to amber to green)."""
+    if value is None or pd.isna(value):
+        return ""
+    return f"background-color: {risk_color(float(value), bad, good)}33; color: {risk_color(float(value), bad, good)}; font-weight: 600"
+
+
+def style_portfolio(df: pd.DataFrame):
+    ranges = {
+        "net_revenue_retention": (85.0, 115.0),
+        "gross_margin": (50.0, 80.0),
+        "ltv_cac_ratio": (1.0, 3.0),
+        "runway_months": (3.0, 12.0),
+        "confidence_score": (0.6, 0.95),
+        "ebitda": (-1_000_000.0, 1_000_000.0),
+    }
+    styler = df.style
+    for col, (bad, good) in ranges.items():
+        if col in df.columns:
+            styler = styler.map(lambda v, b=bad, g=good: gradient_cell(v, b, g), subset=[col])
+    usd = fmt_usd
+    formats = {
+        "arr": usd, "mrr": usd, "cac": usd, "ltv": usd,
+        "monthly_burn_rate": usd, "total_debt": usd, "ebitda": usd,
+        "net_revenue_retention": "{:.1f}%", "gross_margin": "{:.1f}%",
+        "ltv_cac_ratio": "{:.2f}x", "runway_months": "{:.1f}", "confidence_score": "{:.0%}",
+    }
+    return styler.format({k: v for k, v in formats.items() if k in df.columns}, na_rep="N/A")
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Configuration")
 env_api_key = os.getenv("ANTHROPIC_API_KEY", "")
 user_api_key = st.sidebar.text_input(
     "Anthropic API Key",
     value=env_api_key,
     type="password",
-    help="Enter your Anthropic API Key (sk-ant-...) if not set in environment.",
+    help="Needed only for 'Run AI Extraction'. It is held only for this session and is "
+    "never saved by the app. The sample deal works without one.",
 )
-
 api_key = user_api_key.strip() or env_api_key
 
 st.sidebar.divider()
 st.sidebar.subheader("🤖 AI Settings")
 model_choice = st.sidebar.selectbox(
     "Claude Model",
-    ["claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],
-    index=0,
+    SUPPORTED_MODELS,
+    index=SUPPORTED_MODELS.index(DEFAULT_MODEL),
+    help="These models support the forced tool call the extractor uses.",
+)
+enforce_thresholds = st.sidebar.toggle(
+    "Highlight Outlier Metrics",
+    value=True,
+    help="Shows automated underwriting flags (margin, LTV/CAC, NRR, runway, Rule of 40, DSCR).",
+)
+st.sidebar.divider()
+st.sidebar.caption(
+    "No API key? Use **Load sample deal** on the first tab to see the full dashboard "
+    "with fictional data."
 )
 
-enforce_thresholds = st.sidebar.toggle("Highlight Outlier Metrics", value=True)
-
-st.title("DealVanguard AI — Enterprise Deal Diligence")
-st.caption("AI-powered financial extraction & risk analysis for deal execution")
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
+    <div class="dv-hero">
+      <h1>DealVanguard AI: Enterprise Deal Diligence</h1>
+      <p>AI-powered financial extraction and risk analysis for deal execution</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 tab_extract, tab_deals = st.tabs(["⚡ AI Deal Ingestion", "📊 Portfolio Deals"])
+existing_deals = db.fetch_all_deals()
 
+# ---------------------------------------------------------------------------
+# Tab 1: ingestion
+# ---------------------------------------------------------------------------
 with tab_extract:
-    st.header("Deal Data Ingestion & Analytics")
+    st.markdown(
+        section_header(
+            "Deal Data Ingestion & Analytics",
+            "Start with the sample deal, reopen a saved deal, or extract a new one from a document.",
+        ),
+        unsafe_allow_html=True,
+    )
 
-    existing_deals = db.fetch_all_deals()
+    if "load_error" in st.session_state:
+        st.error(st.session_state.pop("load_error"))
 
-    c_mode1, c_mode2 = st.columns([1, 1])
+    c_mode1, c_mode2 = st.columns(2)
 
     with c_mode1:
-        st.subheader("1. Load Saved Deal from Database")
-        if existing_deals:
-            deal_map = {}
-            for d in existing_deals:
-                company = (
-                    d.get("company_name")
-                    if isinstance(d, dict)
-                    else getattr(d, "company_name", "Unknown")
-                )
-                d_id = (
-                    d.get("deal_id")
-                    if isinstance(d, dict)
-                    else getattr(d, "deal_id", "N/A")
-                )
-                deal_map[f"{company} ({d_id})"] = d
+        st.subheader("1. Open a Deal")
+        st.button(
+            "▶ Load sample deal (no API key needed)",
+            type="primary",
+            on_click=on_load_sample,
+            help="Loads a fictional example company so you can explore the whole dashboard.",
+        )
+        st.caption("Fictional example data. Nothing is saved to the database.")
 
-            selected_deal_label = st.selectbox(
-                "Select a previous deal entry to populate dashboard:",
-                options=["-- Select a Saved Deal --"] + list(deal_map.keys()),
+        if existing_deals:
+            deal_map = {f"{d.get('company_name', 'Unknown')} ({d.get('deal_id', 'N/A')})": d for d in existing_deals}
+            st.session_state["_deal_map"] = deal_map
+            st.selectbox(
+                "Or open a previously saved deal:",
+                options=[PLACEHOLDER] + list(deal_map.keys()),
+                key="saved_deal_select",
+                on_change=on_load_saved,
+            )
+        else:
+            st.info(
+                "No saved deals yet. Deals you extract with your own API key are saved here "
+                "(on Streamlit Community Cloud this storage resets when the app restarts)."
             )
 
-            if selected_deal_label != "-- Select a Saved Deal --":
-                chosen_record = deal_map[selected_deal_label]
-                if not isinstance(chosen_record, dict) and hasattr(
-                    chosen_record, "__dict__"
-                ):
-                    chosen_record = chosen_record.__dict__
-
-                try:
-                    parsed_result = build_extraction_result_from_db_record(
-                        chosen_record
-                    )
-                    st.session_state["extraction_result"] = parsed_result
-                    st.toast(
-                        f"Loaded {selected_deal_label} onto dashboard!", icon="📊"
-                    )
-                except Exception as e:
-                    st.error(f"Failed to load database entry: {e}")
-        else:
-            st.info("No saved deals found in DuckDB database.")
-
     with c_mode2:
-        st.subheader("2. Extract New Deal from Document")
-
+        st.subheader("2. Extract a New Deal from a Document")
         source_option = st.radio(
-            "Input Source", ["Text Area", "File Upload"], horizontal=True
+            "Input Source", ["Text Area", "File Upload"], horizontal=True, key="source_option"
         )
         document_text = ""
 
         if source_option == "Text Area":
             document_text = st.text_area(
                 "Paste CIM / Pitch Deck Content",
-                height=180,
-                placeholder="Paste raw deal memorandum or text here...",
+                height=170,
+                key="document_text",
+                placeholder="Paste a deal memorandum, CIM or pitch deck text here...",
             )
         else:
-            uploaded_file = st.file_uploader(
-                "Upload Document (.txt, .md)", type=["txt", "md"]
-            )
+            uploaded_file = st.file_uploader("Upload Document (.txt, .md)", type=["txt", "md"])
             if uploaded_file is not None:
-                document_text = uploaded_file.read().decode("utf-8")
+                document_text = uploaded_file.read().decode("utf-8", errors="replace")
 
-        run_btn = st.button(
+        b1, b2 = st.columns([1, 1])
+        run_btn = b1.button(
             "Run AI Extraction",
             type="primary",
             disabled=not bool(document_text.strip()),
+            help="Sends the text to Claude with your API key and saves the validated result.",
+        )
+        b2.button(
+            "Use sample memo text",
+            on_click=on_use_sample_memo,
+            help="Fills the text box with a fictional memo. Extraction still needs your API key.",
         )
 
         if run_btn:
             if not api_key:
                 st.error(
-                    "Please provide an Anthropic API Key in the sidebar or set ANTHROPIC_API_KEY in environment."
+                    "Add your Anthropic API key in the sidebar to run extraction. "
+                    "To explore without a key, click 'Load sample deal'."
                 )
             else:
+                extracted: Optional[ExtractionResult] = None
                 with st.spinner("Analyzing deal document with Claude..."):
                     try:
-                        extractor = DealExtractor(
-                            api_key=api_key, model=model_choice
-                        )
-                        extracted_result = extractor.extract_from_text(
-                            document_text
-                        )
-
-                        st.session_state["extraction_result"] = extracted_result
-
+                        extractor = DealExtractor(api_key=api_key, model=model_choice)
+                        extracted = extractor.extract_from_text(document_text)
                         deal_id = f"DEAL-{uuid.uuid4().hex[:8].upper()}"
-                        db.save_deal(
-                            deal_id=deal_id, extraction=extracted_result
+                        db.save_deal(deal_id=deal_id, extraction=extracted)
+                        set_active_result(
+                            extracted, "extracted", f"{extracted.metadata.company_name} ({deal_id})"
                         )
-                        st.toast(
-                            "Deal successfully saved to DuckDB!", icon="✅"
-                        )
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Extraction failed: {str(e)}")
+                    except Exception as exc:
+                        extracted = None
+                        st.error(f"Extraction failed: {exc}")
+                if extracted is not None:
+                    st.rerun()
 
     st.divider()
 
-    if "extraction_result" in st.session_state:
-        result: ExtractionResult = st.session_state["extraction_result"]
+    result: Optional[ExtractionResult] = st.session_state.get("extraction_result")
 
-        st.success(f"Active Dashboard View: {result.metadata.company_name}")
-
-        extracted_date = (
-            getattr(result.metadata, "as_of_date", None)
-            or getattr(result.metadata, "as_of", None)
-            or getattr(result.metadata, "report_date", None)
-            or getattr(result.metadata, "date", None)
+    if result is None:
+        st.info(
+            "**No deal is open yet.** Click **Load sample deal** to see the full dashboard "
+            "right away, or paste a document and run extraction with your own Anthropic API key."
         )
+    else:
+        source = st.session_state.get("result_source", "saved")
+        head_l, head_r = st.columns([5, 1])
+        if source == "sample":
+            head_l.markdown(
+                '<div class="dv-sample"><b>SAMPLE DATA.</b> The company, numbers and risks below are '
+                "fictional and exist only to demonstrate the dashboard.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            head_l.success(f"Active dashboard: {st.session_state.get('result_label', result.metadata.company_name)}")
+        head_r.button("Clear dashboard", on_click=on_clear)
 
-        base_date = None
-        if extracted_date:
-            try:
-                base_date = pd.to_datetime(extracted_date)
-            except Exception:
-                base_date = None
+        m = result.metrics
+        meta = result.metadata
+        base_date = parse_base_date(meta.as_of_date)
+        trailing_quarters, forward_quarters = quarter_labels(base_date)
+        monthly_labels = [d.strftime("%b '%y") for d in pd.date_range(start=base_date, periods=6, freq="MS")]
+        arr_m = m.arr / 1e6
+        ebitda_margin = (m.ebitda / m.arr * 100.0) if m.arr else 0.0
+        analytics = DealAnalyticsEngine.analyze_deal(m)
+        stress = DealStressEngine(m)
+        scenarios = stress.run_revenue_haircut_scenario()
+        dscr = stress.calculate_debt_service_coverage()
 
-        if base_date is None or pd.isna(base_date):
-            base_date = datetime.now()
-
-        base_year = base_date.year
-        base_quarter = (base_date.month - 1) // 3 + 1
-
-        trailing_quarters = []
-        for i in range(4, -1, -1):
-            q_off = base_quarter - i
-            y_adj = (q_off - 1) // 4
-            q_num = ((q_off - 1) % 4) + 1
-            trailing_quarters.append(f"Q{q_num} '{str(base_year + y_adj)[-2:]}")
-
-        forward_quarters = []
-        for i in range(5):
-            q_off = base_quarter + i
-            y_adj = (q_off - 1) // 4
-            q_num = ((q_off - 1) % 4) + 1
-            forward_quarters.append(f"Q{q_num} '{str(base_year + y_adj)[-2:]}")
-
-        monthly_dates = pd.date_range(start=base_date, periods=6, freq="MS")
-        monthly_labels = [d.strftime("%b '%y") for d in monthly_dates]
-
-        raw_gm = result.metrics.gross_margin
-        gm_pct = (
-            (raw_gm * 100.0) if (raw_gm is not None and raw_gm <= 1.0) else raw_gm
+        # ---- KPI cards -----------------------------------------------------
+        st.markdown(
+            section_header(
+                f"Deal Snapshot: {meta.company_name}",
+                f"{meta.industry_sector}  |  {meta.capital_structure.value}"
+                + (f"  |  as of {meta.as_of_date}" if meta.as_of_date else ""),
+            ),
+            unsafe_allow_html=True,
         )
-
-        # Key Metrics
-        k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
-        k1.metric(
-            "ARR",
-            f"${result.metrics.arr:,.2f}"
-            if result.metrics.arr is not None
-            else "N/A",
+        row1 = st.columns(4)
+        row2 = st.columns(4)
+        row1[0].metric("ARR", fmt_usd_compact(m.arr), help=fmt_usd(m.arr, 2))
+        row1[1].metric("MRR", fmt_usd_compact(m.mrr), help=fmt_usd(m.mrr, 2))
+        row1[2].metric(
+            "Gross Margin",
+            fmt_pct(m.gross_margin),
+            f"{m.gross_margin - MIN_GROSS_MARGIN_PCT:+.1f} pts vs {MIN_GROSS_MARGIN_PCT:.0f}% target",
         )
-        k2.metric(
-            "MRR",
-            f"${result.metrics.mrr:,.2f}"
-            if result.metrics.mrr is not None
-            else "N/A",
-        )
-        k3.metric("Gross Margin", f"{gm_pct:.1f}%" if gm_pct is not None else "N/A")
-        k4.metric(
+        row1[3].metric(
             "LTV / CAC",
-            f"{result.metrics.ltv_cac_ratio:.2f}x"
-            if result.metrics.ltv_cac_ratio is not None
-            else "N/A",
+            fmt_ratio(m.ltv_cac_ratio),
+            f"{m.ltv_cac_ratio - MIN_LTV_CAC:+.2f}x vs {MIN_LTV_CAC:.1f}x target",
         )
-        k5.metric(
+        row2[0].metric(
             "NRR",
-            f"{result.metrics.net_revenue_retention:.1f}%"
-            if result.metrics.net_revenue_retention is not None
-            else "N/A",
+            fmt_pct(m.net_revenue_retention),
+            f"{m.net_revenue_retention - MIN_NRR_PCT:+.1f} pts vs {MIN_NRR_PCT:.0f}%",
         )
-        k6.metric(
-            "EBITDA",
-            f"${result.metrics.ebitda:,.2f}"
-            if result.metrics.ebitda is not None
-            else "N/A",
-        )
-        k7.metric(
-            "Runway",
-            f"{result.metrics.runway_months:.1f} mo"
-            if result.metrics.runway_months is not None
-            else "N/A",
-        )
-        k8.metric(
+        row2[1].metric("EBITDA", fmt_usd_compact(m.ebitda), f"{ebitda_margin:+.0f}% margin", help=fmt_usd(m.ebitda, 2))
+        if m.runway_months is not None:
+            row2[2].metric(
+                "Runway",
+                fmt_months(m.runway_months),
+                f"{m.runway_months - RUNWAY_TARGET_MONTHS:+.1f} mo vs {RUNWAY_TARGET_MONTHS:.0f} mo",
+            )
+        else:
+            row2[2].metric("Runway", "N/A")
+        row2[3].metric(
             "Confidence",
-            f"{result.confidence_score * 100:.0f}%"
-            if result.confidence_score is not None
-            else "N/A",
+            f"{result.confidence_score * 100:.0f}%",
+            f"{(result.confidence_score - CONFIDENCE_TARGET) * 100:+.0f} pts vs {CONFIDENCE_TARGET:.0%}",
         )
 
         with st.expander("Detailed Metric Breakdown", expanded=True):
-            d_col1, d_col2, d_col3 = st.columns(3)
-            d_col1.write(
-                f"**MRR:** ${result.metrics.mrr:,.2f}"
-                if result.metrics.mrr is not None
-                else "**MRR:** N/A"
-            )
-            d_col1.write(
-                f"**Gross Margin:** {gm_pct:.1f}%"
-                if gm_pct is not None
-                else "**Gross Margin:** N/A"
-            )
-            d_col1.write(
-                f"**Total Debt:** ${result.metrics.total_debt:,.2f}"
-                if result.metrics.total_debt is not None
-                else "**Total Debt:** N/A"
-            )
-
-            d_col2.write(
-                f"**CAC:** ${result.metrics.cac:,.2f}"
-                if result.metrics.cac is not None
-                else "**CAC:** N/A"
-            )
-            d_col2.write(
-                f"**LTV:** ${result.metrics.ltv:,.2f}"
-                if result.metrics.ltv is not None
-                else "**LTV:** N/A"
-            )
-            d_col2.write(
-                f"**LTV:CAC Ratio:** {result.metrics.ltv_cac_ratio:.2f}x"
-                if result.metrics.ltv_cac_ratio is not None
-                else "**LTV:CAC Ratio:** N/A"
-            )
-
-            d_col3.write(
-                f"**Monthly Burn:** ${result.metrics.monthly_burn_rate:,.2f}"
-                if result.metrics.monthly_burn_rate is not None
-                else "**Monthly Burn:** N/A"
-            )
-            d_col3.write(
-                f"**Runway:** {f'{result.metrics.runway_months:.1f} months' if result.metrics.runway_months is not None else 'N/A'}"
-            )
-
-            cap_struct = getattr(
-                result.metadata.capital_structure,
-                "value",
-                result.metadata.capital_structure,
-            )
-            d_col3.write(f"**Capital Structure:** {cap_struct}")
-
-            st.divider()
-
-        st.subheader("📈 Deal Intelligence & Cohort Analytics")
-
-        ch_col1, ch_col2 = st.columns(2)
-
-        # 1. ARR Waterfall
-        with ch_col1:
-            st.markdown("#### 1. ARR Bridge (Waterfall)")
-            arr_val = (result.metrics.arr / 1e6) if result.metrics.arr else 0.0
-            fig_waterfall = go.Figure(
-                go.Waterfall(
-                    orientation="v",
-                    measure=[
-                        "absolute",
-                        "relative",
-                        "relative",
-                        "relative",
-                        "total",
-                    ],
-                    x=[
-                        "Beginning ARR",
-                        "New Business",
-                        "Expansion",
-                        "Churn",
-                        "Ending ARR",
-                    ],
-                    textposition="outside",
-                    y=[
-                        arr_val * 0.8,
-                        arr_val * 0.25,
-                        arr_val * 0.05,
-                        -arr_val * 0.1,
-                        arr_val,
-                    ],
-                    decreasing={"marker": {"color": "#E53E3E"}},
-                    increasing={"marker": {"color": "#38A169"}},
-                    totals={"marker": {"color": "#3182CE"}},
-                )
-            )
-            fig_waterfall.update_layout(
-                template="plotly_dark",
-                height=320,
-                margin=dict(l=10, r=10, t=20, b=10),
-            )
-            st.plotly_chart(fig_waterfall, use_container_width=True)
-
-        # 2. Customer Economics
-        with ch_col2:
-            st.markdown("#### 2. Customer Economics (LTV vs. CAC)")
-            cac_val = result.metrics.cac or 0.0
-            ltv_val = result.metrics.ltv or 0.0
-            df_scatter = pd.DataFrame([
-                {"Segment": "Target Deal Metric", "CAC": cac_val, "LTV": ltv_val},
-                {
-                    "Segment": "Peer Benchmark",
-                    "CAC": cac_val * 0.85,
-                    "LTV": cac_val * 2.8,
-                },
-                {
-                    "Segment": "Top Decile Benchmark",
-                    "CAC": cac_val * 0.7,
-                    "LTV": cac_val * 4.5,
-                },
-            ])
-            fig_scatter = px.scatter(
-                df_scatter,
-                x="CAC",
-                y="LTV",
-                color="Segment",
-                size=[30, 20, 20],
-                size_max=30,
-            )
-            fig_scatter.add_trace(
-                go.Scatter(
-                    x=[0, cac_val * 1.5 if cac_val else 1],
-                    y=[0, cac_val * 4.5 if cac_val else 1],
-                    mode="lines",
-                    name="3.0x Target Line",
-                    line=dict(dash="dash", color="#CBD5E0"),
-                )
-            )
-            fig_scatter.update_layout(template="plotly_dark", height=320)
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-        ch_col3, ch_col4 = st.columns(2)
-
-        # 3. Retention Cohort Heatmap
-        with ch_col3:
-            st.markdown("#### 3. Net Retention Heatmap (%)")
-            nrr_base = (
-                result.metrics.net_revenue_retention
-                if result.metrics.net_revenue_retention
-                else 100.0
-            )
-            decay_rates = [1.0, 0.96, 0.93, 0.90, 0.88, 0.86]
-            retention_matrix = [
-                [round(100.0 * d * (1.0 + (i * 0.01)), 1) for d in decay_rates]
-                for i in range(5)
-            ]
-
-            fig_cohort = go.Figure(
-                data=go.Heatmap(
-                    z=retention_matrix,
-                    x=["M0", "M1", "M2", "M3", "M4", "M5"],
-                    y=trailing_quarters,
-                    colorscale="RdYlGn",
-                    texttemplate="%{z}%",
-                    zmin=50,
-                    zmax=max(110.0, nrr_base),
-                )
-            )
-            fig_cohort.update_layout(template="plotly_dark", height=320)
-            st.plotly_chart(fig_cohort, use_container_width=True)
-
-        # 4. Pareto Concentration Chart
-        with ch_col4:
-            st.markdown("#### 4. Revenue Concentration Pareto")
-            top_custs = getattr(result.metrics, "top_customers", None)
-
-            if top_custs and isinstance(top_custs, list):
-                ranks = [c.name.replace("#", "") for c in top_custs]
-                revs = [c.arr_contribution for c in top_custs]
+            d1, d2, d3 = st.columns(3)
+            gm_level = risk_level(m.gross_margin, 50.0, 80.0)
+            lc_level = risk_level(m.ltv_cac_ratio, 1.0, 3.0)
+            nrr_level = risk_level(m.net_revenue_retention, 85.0, 115.0)
+            d1.markdown(f"**MRR:** {fmt_usd(m.mrr, 2)}")
+            d1.markdown(f"**Gross Margin:** {badge(fmt_pct(m.gross_margin), gm_level)}", unsafe_allow_html=True)
+            d1.markdown(f"**Total Debt:** {fmt_usd(m.total_debt, 2)}")
+            d2.markdown(f"**CAC:** {fmt_usd(m.cac, 2)}")
+            d2.markdown(f"**LTV:** {fmt_usd(m.ltv, 2)}")
+            d2.markdown(f"**LTV:CAC Ratio:** {badge(fmt_ratio(m.ltv_cac_ratio), lc_level)}", unsafe_allow_html=True)
+            d3.markdown(f"**Monthly Burn:** {fmt_usd(m.monthly_burn_rate, 2)}")
+            if m.runway_months is not None:
+                rw_level = risk_level(m.runway_months, 3.0, 12.0)
+                d3.markdown(f"**Runway:** {badge(fmt_months(m.runway_months), rw_level)}", unsafe_allow_html=True)
             else:
-                arr_total = result.metrics.arr or 0.0
-                ranks = [f"Cust {i}" for i in range(1, 6)]
-                shares = [0.25, 0.18, 0.12, 0.08, 0.05]
-                revs = [arr_total * p for p in shares]
+                d3.markdown("**Runway:** N/A")
+            d3.markdown(f"**NRR:** {badge(fmt_pct(m.net_revenue_retention), nrr_level)}", unsafe_allow_html=True)
+            d3.markdown(f"**Capital Structure:** {meta.capital_structure.value}")
 
-            total_rev = result.metrics.arr or (sum(revs) if sum(revs) > 0 else 1.0)
-            cum_pct = []
-            running = 0.0
-            for r in revs:
-                running += r
-                cum_pct.append(round((running / total_rev) * 100, 1))
-
-            fig_pareto = go.Figure()
-            fig_pareto.add_trace(
-                go.Bar(
-                    x=ranks,
-                    y=revs,
-                    name="ARR Share ($)",
-                    marker_color="#4FD1C5",
-                )
-            )
-            fig_pareto.add_trace(
-                go.Scatter(
-                    x=ranks,
-                    y=cum_pct,
-                    name="Cumulative %",
-                    yaxis="y2",
-                    mode="lines+markers",
-                    line=dict(color="#ED8936", width=3),
-                )
-            )
-            fig_pareto.update_layout(
-                template="plotly_dark",
-                height=320,
-                yaxis=dict(title="ARR Contribution ($)"),
-                yaxis2=dict(
-                    title="Cumulative Share (%)",
-                    overlaying="y",
-                    side="right",
-                    range=[0, 105],
-                ),
-            )
-            st.plotly_chart(fig_pareto, use_container_width=True)
-
-        # 5. Trailing Growth
-        st.markdown("#### Quarterly ARR Growth Trend")
-        arr_val = (result.metrics.arr / 1e6) if result.metrics.arr else 0.0
-        df_growth = pd.DataFrame({
-            "Quarter": trailing_quarters,
-            "ARR ($M)": [
-                arr_val * 0.75,
-                arr_val * 0.82,
-                arr_val * 0.89,
-                arr_val * 0.94,
-                arr_val,
-            ],
-        })
-        fig_growth = px.bar(
-            df_growth, x="Quarter", y="ARR ($M)", text_auto=".2f"
+        # ---- Analytics charts ------------------------------------------------
+        st.markdown(
+            section_header(
+                "📈 Deal Intelligence & Cohort Analytics",
+                "Charts tagged ILLUSTRATIVE use fixed assumptions because the extraction schema "
+                "does not capture quarterly history, cohorts or customer lists.",
+            ),
+            unsafe_allow_html=True,
         )
-        fig_growth.update_layout(
-            template="plotly_dark", height=280, xaxis_type="category"
+
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            chart_title("1. ARR Bridge (Waterfall)", "ILLUSTRATIVE: split is assumed (80% beginning, +25% new, +5% expansion, -10% churn).")
+            st.plotly_chart(charts.arr_bridge(arr_m), key="chart_bridge")
+        with ch2:
+            chart_title(
+                "2. Customer Economics (LTV vs. CAC)",
+                "Target deal is extracted data. Shaded zones are the 1x and 3x LTV:CAC lines. "
+                "Peer and top-decile points are ILLUSTRATIVE.",
+            )
+            st.plotly_chart(charts.unit_economics(m.cac, m.ltv), key="chart_unit")
+
+        ch3, ch4 = st.columns(2)
+        with ch3:
+            chart_title("3. Net Retention Heatmap (%)", "ILLUSTRATIVE: fixed decay curve, not real cohort data.")
+            st.plotly_chart(
+                charts.retention_heatmap(m.net_revenue_retention, trailing_quarters), key="chart_heat"
+            )
+        with ch4:
+            chart_title("4. Revenue Concentration Pareto", "ILLUSTRATIVE: assumed top-5 customer shares (25%, 18%, 12%, 8%, 5% of ARR).")
+            st.plotly_chart(charts.concentration_pareto(m.arr), key="chart_pareto")
+
+        chart_title("Quarterly ARR Growth Trend", "ILLUSTRATIVE: back-cast from current ARR with fixed factors. Bar color follows QoQ growth.")
+        st.plotly_chart(charts.arr_growth(trailing_quarters, arr_m), key="chart_growth")
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            chart_title("Scenario Trajectory ($M)", "ILLUSTRATIVE: fixed growth multipliers for each case.")
+            st.plotly_chart(charts.scenario_trajectory(forward_quarters, arr_m), key="chart_scen")
+        with sc2:
+            chart_title("Cash Runway Drawdown ($M)", "Derived: implied cash = monthly burn x runway. Bars shift from green to red as cash nears zero.")
+            fig_cash = charts.cash_drawdown(m.monthly_burn_rate, m.runway_months or 0.0, monthly_labels)
+            if fig_cash is None:
+                st.info("Needs a monthly burn rate and runway above zero to estimate cash. None reported for this deal.")
+            else:
+                st.plotly_chart(fig_cash, key="chart_cash")
+
+        # ---- Stress tests ----------------------------------------------------
+        st.markdown(
+            section_header(
+                "🧪 Downside Stress Tests",
+                "Calculated from the extracted metrics by DealStressEngine.",
+            ),
+            unsafe_allow_html=True,
         )
-        st.plotly_chart(fig_growth, use_container_width=True)
-
-        # 6. Scenario & Cash Drawdown
-        c_scen1, c_scen2 = st.columns(2)
-        with c_scen1:
-            st.markdown("#### Scenario Trajectory ($M)")
-            arr_base = (result.metrics.arr / 1e6) if result.metrics.arr else 0.0
-
-            df_scenarios = pd.DataFrame({
-                "Quarter": forward_quarters,
-                "Downside Case": [
-                    arr_base,
-                    arr_base * 0.98,
-                    arr_base * 0.95,
-                    arr_base * 0.92,
-                    arr_base * 0.90,
-                ],
-                "Base Case": [
-                    arr_base,
-                    arr_base * 1.05,
-                    arr_base * 1.10,
-                    arr_base * 1.16,
-                    arr_base * 1.22,
-                ],
-                "Upside Case": [
-                    arr_base,
-                    arr_base * 1.10,
-                    arr_base * 1.21,
-                    arr_base * 1.33,
-                    arr_base * 1.45,
-                ],
-            }).set_index("Quarter")
-
-            fig_scenarios = px.line(
-                df_scenarios,
-                markers=True,
-                color_discrete_map={
-                    "Downside Case": "#E53E3E",
-                    "Base Case": "#3182CE",
-                    "Upside Case": "#38A169",
-                },
-            )
-            fig_scenarios.update_layout(
-                template="plotly_dark",
-                height=300,
-                xaxis_type="category",
-                margin=dict(l=10, r=10, t=20, b=10),
-            )
-            st.plotly_chart(fig_scenarios, use_container_width=True)
-
-        with c_scen2:
-            st.markdown("#### Cash Runway Drawdown ($M)")
-            burn_m = (
-                (result.metrics.monthly_burn_rate / 1e6)
-                if result.metrics.monthly_burn_rate
-                else 0.0
-            )
-            runway_m = (
-                result.metrics.runway_months
-                if result.metrics.runway_months
-                else 0.0
-            )
-            initial_cash = burn_m * runway_m
-
-            df_cash = pd.DataFrame({
-                "Month": monthly_labels,
-                "Cash Balance ($M)": [
-                    max(0.0, initial_cash - (burn_m * i)) for i in range(6)
-                ],
-            }).set_index("Month")
-
-            st.bar_chart(df_cash, height=280)
-
-        # Diligence Findings
-        if enforce_thresholds:
-            st.markdown("#### Persistent Diligence Findings")
-            if gm_pct is not None:
-                if gm_pct < 70.0:
-                    st.warning(
-                        f"**Gross Margin Drag:** Gross Margin of {gm_pct:.1f}% is below target enterprise threshold (>70%)."
-                    )
-                else:
-                    st.success(
-                        "**Healthy Gross Margin:** Unit economics meet standard software benchmarks."
-                    )
-
-            if (
-                result.metrics.ltv_cac_ratio is not None
-                and result.metrics.ltv_cac_ratio < 3.0
-            ):
-                st.warning(
-                    f"**Unit Economics Alert:** LTV:CAC ratio of {result.metrics.ltv_cac_ratio:.2f}x is under target 3.0x threshold."
+        s1, s2 = st.columns([3, 2])
+        with s1:
+            chart_title("Runway After Revenue Haircuts", "Revenue loss is added to monthly burn; cash is implied from burn x runway.")
+            fig_stress = charts.stress_runway(m.runway_months, scenarios)
+            if fig_stress is None:
+                st.info("Runway stress needs a non-zero burn rate and a reported runway.")
+            else:
+                st.plotly_chart(fig_stress, key="chart_stress")
+        with s2:
+            fig_dscr = charts.dscr_gauge(dscr["dscr"])
+            if fig_dscr is None:
+                st.markdown('<div class="dv-chart-title">Debt Service Coverage</div>', unsafe_allow_html=True)
+                st.info(f"DSCR: {dscr['status']}.")
+            else:
+                st.plotly_chart(fig_dscr, key="chart_dscr")
+                st.markdown(
+                    f"{badge(dscr['status'], 'good' if dscr['status'] == 'Healthy' else 'bad')} "
+                    f"Annual interest at 8%: {fmt_usd(dscr['annual_interest'])}",
+                    unsafe_allow_html=True,
                 )
-
-            if (
-                result.metrics.net_revenue_retention is not None
-                and result.metrics.net_revenue_retention >= 105.0
-            ):
-                st.success(
-                    f"**Strong Expansion:** NRR of {result.metrics.net_revenue_retention:.1f}% indicates positive net account growth."
-                )
-
-        # Audit Table
-        st.markdown("#### AI Extraction Confidence & Provenance Audit")
-        df_prov = pd.DataFrame([
-            {
-                "Metric": "ARR",
-                "Extracted Value": f"${result.metrics.arr:,.2f}"
-                if result.metrics.arr is not None
-                else "N/A",
-                "Confidence": result.confidence_score or 0.0,
-                "Status": "VERIFIED",
-            },
-            {
-                "Metric": "NRR",
-                "Extracted Value": f"{result.metrics.net_revenue_retention:.1f}%"
-                if result.metrics.net_revenue_retention is not None
-                else "N/A",
-                "Confidence": (result.confidence_score * 0.95)
-                if result.confidence_score
-                else 0.9,
-                "Status": "VERIFIED",
-            },
-            {
-                "Metric": "EBITDA",
-                "Extracted Value": f"${result.metrics.ebitda:,.2f}"
-                if result.metrics.ebitda is not None
-                else "N/A",
-                "Confidence": (result.confidence_score * 0.90)
-                if result.confidence_score
-                else 0.85,
-                "Status": "REVIEW",
-            },
-            {
-                "Metric": "Total Debt",
-                "Extracted Value": f"${result.metrics.total_debt:,.2f}"
-                if result.metrics.total_debt is not None
-                else "N/A",
-                "Confidence": (result.confidence_score * 0.98)
-                if result.confidence_score
-                else 0.95,
-                "Status": "VERIFIED",
-            },
-        ])
-
+        scen_df = pd.DataFrame(
+            [
+                {
+                    "Revenue haircut": f"-{s['haircut_pct']:.0f}%",
+                    "Stressed ARR": s["stressed_arr"],
+                    "Monthly burn": s["monthly_burn"],
+                    "Runway (months)": s["projected_runway_months"],
+                }
+                for s in scenarios
+            ]
+        )
         st.dataframe(
-            df_prov,
-            column_config={
-                "Confidence": st.column_config.ProgressColumn(
-                    "Confidence Score",
-                    min_value=0.0,
-                    max_value=1.0,
-                    format="%.0f%%",
-                ),
-            },
-            use_container_width=True,
+            scen_df.style.map(lambda v: gradient_cell(v, 0.0, 12.0), subset=["Runway (months)"]).format(
+                {"Stressed ARR": fmt_usd, "Monthly burn": fmt_usd, "Runway (months)": "{:.1f}"},
+                na_rep="N/A",
+            ),
+            hide_index=True,
+        )
+
+        # ---- Diligence findings -----------------------------------------------
+        if enforce_thresholds:
+            st.markdown(
+                section_header("🚦 Persistent Diligence Findings", "Automated underwriting checks from DealAnalyticsEngine."),
+                unsafe_allow_html=True,
+            )
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Rule of 40 (NRR proxy)", f"{analytics.rule_of_40:.1f}", f"{analytics.rule_of_40 - 40:+.1f} vs 40")
+            a2.metric("Annual burn / ARR", f"{analytics.annual_burn_to_arr:.2f}x")
+            a3.metric(
+                "Runway after 20% revenue haircut",
+                fmt_months(analytics.runway_stress_tested),
+                None if analytics.runway_stress_tested is None else f"{analytics.runway_stress_tested - 6:+.1f} mo vs 6 mo",
+            )
+            for flag in analytics.red_flags:
+                st.markdown(f'<div class="dv-flag">🔴 {flag}</div>', unsafe_allow_html=True)
+            if not analytics.red_flags:
+                st.markdown('<div class="dv-ok">🟢 No underwriting red flags triggered.</div>', unsafe_allow_html=True)
+            if m.gross_margin >= MIN_GROSS_MARGIN_PCT:
+                st.markdown('<div class="dv-ok">🟢 <b>Healthy gross margin:</b> unit economics meet standard software benchmarks.</div>', unsafe_allow_html=True)
+            if m.net_revenue_retention >= 105.0:
+                st.markdown(
+                    f'<div class="dv-ok">🟢 <b>Strong expansion:</b> NRR of {m.net_revenue_retention:.1f}% indicates positive net account growth.</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # ---- Sanity checks table -----------------------------------------------
+        st.markdown(
+            section_header(
+                "🔎 AI Extraction Confidence & Sanity Checks",
+                "Claude returns one confidence score for the whole extraction (there is no per-field "
+                "scoring). Status is a rule-based cross-check done in this app.",
+            ),
+            unsafe_allow_html=True,
+        )
+        arr_gap = abs(m.mrr * 12 - m.arr) / m.arr * 100 if m.arr else 0.0
+        implied_ratio = m.ltv / m.cac if m.cac else 0.0
+        ratio_gap = abs(implied_ratio - m.ltv_cac_ratio) / m.ltv_cac_ratio * 100 if m.ltv_cac_ratio else 0.0
+        debt_to_arr = m.total_debt / m.arr if m.arr else 0.0
+        checks = [
+            ("ARR", fmt_usd(m.arr, 2), "OK" if arr_gap <= 2.0 else "Review",
+             "Matches MRR x 12" if arr_gap <= 2.0 else f"Differs from MRR x 12 by {arr_gap:.1f}%"),
+            ("NRR", fmt_pct(m.net_revenue_retention), "OK" if 50.0 <= m.net_revenue_retention <= 150.0 else "Review",
+             "Within a typical 50-150% range" if 50.0 <= m.net_revenue_retention <= 150.0 else "Unusual value, verify in source"),
+            ("LTV:CAC", fmt_ratio(m.ltv_cac_ratio), "OK" if ratio_gap <= 5.0 else "Review",
+             "Matches LTV / CAC" if ratio_gap <= 5.0 else f"LTV / CAC is {implied_ratio:.2f}x"),
+            ("EBITDA", fmt_usd(m.ebitda, 2), "OK" if m.ebitda >= 0 else "Review",
+             "Positive EBITDA" if m.ebitda >= 0 else f"Negative EBITDA ({ebitda_margin:.0f}% margin)"),
+            ("Total Debt", fmt_usd(m.total_debt, 2), "OK" if debt_to_arr <= 1.0 else "Review",
+             "No debt reported" if m.total_debt == 0 else f"Debt is {debt_to_arr:.2f}x ARR"),
+        ]
+        audit_df = pd.DataFrame(
+            [
+                {"Metric": n, "Extracted Value": v, "Overall Confidence": result.confidence_score, "Status": s, "Check": c}
+                for n, v, s, c in checks
+            ]
+        )
+        st.dataframe(
+            audit_df.style.map(lambda v: gradient_cell(v, 0.6, 0.95), subset=["Overall Confidence"])
+            .map(
+                lambda v: "background-color: #22C55E33; color: #86EFAC; font-weight: 600"
+                if v == "OK"
+                else "background-color: #F59E0B33; color: #FCD34D; font-weight: 600",
+                subset=["Status"],
+            )
+            .format({"Overall Confidence": "{:.0%}"}),
             hide_index=True,
         )
 
         if result.key_risks_identified:
-            st.subheader("Identified Deal Risks")
+            st.markdown(section_header("⚠️ Identified Deal Risks"), unsafe_allow_html=True)
             for risk in result.key_risks_identified:
-                st.warning(f"• {risk}")
+                st.markdown(f'<div class="dv-risk">⚠️ {risk}</div>', unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------------
+# Tab 2: portfolio
+# ---------------------------------------------------------------------------
 with tab_deals:
-    st.header("Portfolio Deals Database")
-    deals = db.fetch_all_deals()
-    if deals:
-        df = pd.DataFrame(deals)
-        st.dataframe(df, use_container_width=True)
+    st.markdown(
+        section_header("Portfolio Deals Database", "Every deal you extract is stored in an embedded DuckDB file."),
+        unsafe_allow_html=True,
+    )
+    if existing_deals:
+        deals_df = pd.DataFrame(existing_deals)
+        lead = [
+            "company_name", "industry_sector", "capital_structure", "arr", "net_revenue_retention",
+            "gross_margin", "ltv_cac_ratio", "runway_months", "ebitda", "confidence_score",
+        ]
+        order = lead + [c for c in deals_df.columns if c not in lead]
+        labels = {
+            "company_name": "Company", "industry_sector": "Sector", "capital_structure": "Capital structure",
+            "arr": "ARR", "net_revenue_retention": "NRR", "gross_margin": "Gross margin",
+            "ltv_cac_ratio": "LTV:CAC", "runway_months": "Runway (mo)", "ebitda": "EBITDA",
+            "confidence_score": "Confidence",
+        }
+        st.dataframe(
+            style_portfolio(deals_df),
+            hide_index=True,
+            column_order=order,
+            column_config={k: st.column_config.Column(v) for k, v in labels.items()},
+        )
+        st.caption("Cell colors follow the value: red is weak, amber is borderline, green is strong.")
     else:
-        st.info("No deal records found in DuckDB database.")
+        st.info(
+            "No saved deals yet. Run an extraction with your own API key and it will appear here. "
+            "The sample deal is not written to the database."
+        )

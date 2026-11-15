@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 import anthropic
 from dealvanguard.ai_extractor import DealExtractor
-from dealvanguard.schemas import ExtractionResult, CapitalStructure
+from dealvanguard.schemas import CapitalStructureType, ExtractionResult
 
 
 @pytest.fixture
@@ -11,7 +11,7 @@ def sample_payload():
         "metadata": {
             "company_name": "Acme SaaS",
             "industry_sector": "B2B Software",
-            "capital_structure": "Bootstrapped",
+            "capital_structure": "Equity",
         },
         "metrics": {
             "arr": 1200000.0,
@@ -33,8 +33,8 @@ def sample_payload():
 
 @patch("anthropic.Anthropic")
 def test_extractor_initialization(mock_anthropic):
-    extractor = DealExtractor(api_key="fake-api-key", model="claude-3-5-sonnet-20241022")
-    assert extractor.model == "claude-3-5-sonnet-20241022"
+    extractor = DealExtractor(api_key="fake-api-key", model="claude-haiku-5-5")
+    assert extractor.model == "claude-haiku-5-5"
     mock_anthropic.assert_called_once_with(api_key="fake-api-key")
 
 
@@ -65,7 +65,7 @@ def test_extract_from_text_success(mock_anthropic, sample_payload):
 
     assert isinstance(result, ExtractionResult)
     assert result.metadata.company_name == "Acme SaaS"
-    assert result.metadata.capital_structure == CapitalStructure.BOOTSTRAPPED
+    assert result.metadata.capital_structure == CapitalStructureType.EQUITY
     assert result.metrics.arr == 1200000.0
     assert result.confidence_score == 0.95
 

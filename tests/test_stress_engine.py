@@ -125,3 +125,12 @@ def test_calculate_dscr_zero_interest_rate(sample_metrics):
     assert result["dscr"] is None
     assert result["annual_interest"] == 0.0
     assert result["status"] == "Zero Interest"
+
+def test_zero_burn_means_cash_unknown_so_runway_is_none():
+    metrics = FinancialMetrics(
+        arr=1000000.0, mrr=83333.33, net_revenue_retention=100.0, gross_margin=70.0,
+        cac=3000.0, ltv=15000.0, ltv_cac_ratio=5.0, monthly_burn_rate=0.0,
+        runway_months=99.0, total_debt=0.0, ebitda=100000.0,
+    )
+    scenarios = DealStressEngine(metrics).run_revenue_haircut_scenario()
+    assert all(s["projected_runway_months"] is None for s in scenarios)

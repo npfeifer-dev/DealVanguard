@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional
 from pydantic import BaseModel, Field, ConfigDict
@@ -10,7 +10,11 @@ class CapitalStructureType(str, Enum):
     EQUITY = "Equity"
 
 class FinancialMetrics(BaseModel):
-    """Core financial metrics extracted from pitch decks, CIMs, or VDR documents."""    
+    """Core financial metrics extracted from pitch decks, CIMs, or VDR documents.
+
+    Percentages (NRR, gross margin) use a 0-100 scale, not fractions.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     arr: float = Field(
@@ -77,7 +81,7 @@ class DealMetadata(BaseModel):
         description="Primary debt/equity instrument of interest."
     )
     extraction_timestamp: str = Field(
-        default_factory=lambda: datetime.utcnow().isoformat(),
+        default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
         description="ISO timestamp of extraction execution."
     )
 
